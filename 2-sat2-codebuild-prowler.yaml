@@ -504,7 +504,7 @@ Resources:
                 python: 3.11
               commands:
                 - echo "Installing Prowler and dependencies..."
-                - pip3 install prowler
+                - pip3 install prowler --quiet
                 - prowler -v
             build:
               commands:
@@ -519,16 +519,31 @@ Resources:
                           account_list=$MULTI_ACCOUNT_LIST_OVERRIDE
                       elif [[ $MULTI_ACCOUNT_LIST_OVERRIDE = '' ]]; then
                           echo "Using accounts from aws organizations."
-                          account_list=$(aws organizations list-accounts --query 'Accounts[?Status==`ACTIVE`].Id' --output text)
+                          if ! account_list=$(aws organizations list-accounts --query 'Accounts[?Status==`ACTIVE`].Id' --output text); then
+                              echo "ERROR: Failed to retrieve account list from AWS Organizations"
+                              exit 1
+                          fi
+                      fi
+
+                      if [[ -z "$account_list" ]]; then
+                          echo "ERROR: No accounts found to scan"
+                          exit 1
                       fi
 
                       echo "Using accounts $account_list."
 
+                      failed_accounts=()
                       for accountId in $account_list; do
                           test "$(jobs | wc -l)" -ge $PARALLEL_ACCOUNTS && wait || true
                           {
                               echo "Running Prowler as prowler $PROWLER_OPTIONS $PROWLER_SCAN_OPTIONS --role arn:$AWS_PARTITION:iam::$accountId:role/service-role/$PROWLER_ROLE "
-                              prowler $PROWLER_OPTIONS $PROWLER_SCAN_OPTIONS --role arn:$AWS_PARTITION:iam::$accountId:role/service-role/$PROWLER_ROLE
+                              prowler $PROWLER_OPTIONS $PROWLER_SCAN_OPTIONS --role arn:$AWS_PARTITION:iam::$accountId:role/service-role/$PROWLER_ROLE -b
+                              PROWLER_EXIT_CODE=$?
+                              if [ $PROWLER_EXIT_CODE -ne 0 ]; then
+                                  echo "ERROR: Prowler scan failed for account $accountId"
+                                  failed_accounts+=($accountId)
+                                  exit $PROWLER_EXIT_CODE
+                              fi
                           } &
                       done
 
@@ -536,21 +551,77 @@ Resources:
 
                       echo "Running a single account scan."
                       echo "Running Prowler as prowler $PROWLER_OPTIONS $PROWLER_SCAN_OPTIONS --role arn:$AWS_PARTITION:iam::$AWS_ACCOUNT_ID:role/service-role/$PROWLER_ROLE "
-                      prowler $PROWLER_OPTIONS $PROWLER_SCAN_OPTIONS --role arn:$AWS_PARTITION:iam::$AWS_ACCOUNT_ID:role/service-role/$PROWLER_ROLE
+                      prowler $PROWLER_OPTIONS $PROWLER_SCAN_OPTIONS --role arn:$AWS_PARTITION:iam::$AWS_ACCOUNT_ID:role/service-role/$PROWLER_ROLE -b
+                      PROWLER_EXIT_CODE=$?
+                      if [ $PROWLER_EXIT_CODE -ne 0 ]; then
+                          echo "ERROR: Prowler scan failed for account $AWS_ACCOUNT_ID with exit code $PROWLER_EXIT_CODE"
+                          exit $PROWLER_EXIT_CODE
+                      fi
 
                   fi
 
                   wait
+
+                  if [[ ${#failed_accounts[@]} -gt 0 ]]; then
+                      echo "WARNING: Prowler scans failed for the following accounts: ${failed_accounts[*]}"
+                      echo "Check logs above for specific error details"
+                  fi
             post_build:
               commands:
-                - echo "Uploading reports to S3..."
-                - aws s3 cp --exclude "*" --include "*.csv" --exclude "compliance**" output/ s3://$BUCKET_REPORT/csv/ --recursive
-                - aws s3 cp --exclude "*" --include "*.csv" output/compliance/ s3://$BUCKET_REPORT/compliance/ --recursive
-                - aws s3 cp --exclude "*" --include "*.ocsf.json" output/ s3://$BUCKET_REPORT/ocsf-json/ --recursive
-                - aws s3 cp --exclude "*" --include "*.json" --exclude "*.ocsf.json" --exclude "*.asff.json" output/ s3://$BUCKET_REPORT/json/ --recursive
-                - aws s3 cp --exclude "*" --include "*.html" output/ s3://$BUCKET_REPORT/html/ --recursive
-                - aws s3 cp --exclude "*" --include "*.asff.json" output/ s3://$BUCKET_REPORT/asff-json/ --recursive
-                - echo "Done!"
+                - echo "CODEBUILD_BUILD_SUCCEEDING status is $CODEBUILD_BUILD_SUCCEEDING "
+                - |
+
+                  if [ $CODEBUILD_BUILD_SUCCEEDING -eq 0 ]; then
+                      echo "The previous build stage Failed. Exiting the post_build stage without uploading any results to S3 buckets";
+                      exit $CODEBUILD_BUILD_SUCCEEDING
+                  elif [ $CODEBUILD_BUILD_SUCCEEDING -eq 1 ]; then
+                      echo "The build stage succeeded. Now uploading reports to S3 bucket ..."
+
+                      upload_failed=false
+
+                      echo "Uploading CSV reports..."
+                      if ! aws s3 cp --exclude "*" --include "*.csv" --exclude "compliance**" output/ s3://$BUCKET_REPORT/csv/ --recursive; then
+                          echo "ERROR: Failed to upload CSV reports"
+                          upload_failed=true
+                      fi
+
+                      echo "Uploading compliance CSV reports..."
+                      if ! aws s3 cp --exclude "*" --include "*.csv" output/compliance/ s3://$BUCKET_REPORT/compliance/ --recursive; then
+                          echo "ERROR: Failed to upload compliance CSV reports"
+                          upload_failed=true
+                      fi
+
+                      echo "Uploading OCSF JSON reports..."
+                      if ! aws s3 cp --exclude "*" --include "*.ocsf.json" output/ s3://$BUCKET_REPORT/ocsf-json/ --recursive; then
+                          echo "ERROR: Failed to upload OCSF JSON reports"
+                          upload_failed=true
+                      fi
+
+                      echo "Uploading JSON reports..."
+                      if ! aws s3 cp --exclude "*" --include "*.json" --exclude "*.ocsf.json" --exclude "*.asff.json" output/ s3://$BUCKET_REPORT/json/ --recursive; then
+                          echo "ERROR: Failed to upload JSON reports"
+                          upload_failed=true
+                      fi
+
+                      echo "Uploading HTML reports..."
+                      if ! aws s3 cp --exclude "*" --include "*.html" output/ s3://$BUCKET_REPORT/html/ --recursive; then
+                          echo "ERROR: Failed to upload HTML reports"
+                          upload_failed=true
+                      fi
+
+                      echo "Uploading ASFF JSON reports..."
+                      if ! aws s3 cp --exclude "*" --include "*.asff.json" output/ s3://$BUCKET_REPORT/asff-json/ --recursive; then
+                          echo "ERROR: Failed to upload ASFF JSON reports"
+                          upload_failed=true
+                      fi
+
+                      if [[ $upload_failed == true ]]; then
+                          echo "ERROR: One or more S3 uploads failed. Check logs above for details."
+                          exit 1
+                      fi
+
+                      echo "All reports uploaded successfully!"
+                  fi
 
   ProwlerLogGroup:
     Metadata:
