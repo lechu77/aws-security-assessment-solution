@@ -504,7 +504,7 @@ Resources:
                 python: 3.11
               commands:
                 - echo "Installing Prowler and dependencies..."
-                - pip3 install prowler --quiet
+                - pip3 install prowler==5.11 --quiet
                 - prowler -v
             build:
               commands:
